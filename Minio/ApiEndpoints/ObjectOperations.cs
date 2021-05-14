@@ -355,6 +355,95 @@ namespace Minio
             }
             await this.CompleteMultipartUploadAsync(bucketName, objectName, uploadId, etags, cancellationToken).ConfigureAwait(false);
         }
+        
+        /// <summary>
+        /// Creates an object from an inputstream of unknown length.
+        /// PATCH: Benjamin S
+        /// </summary>
+        /// <param name="bucketName">Bucket to create object in</param>
+        /// <param name="objectName">Key of the new object</param>
+        /// <param name="data">Stream of bytes to send</param>
+        /// <param name="contentType">Content type of the new object, null defaults to "application/octet-stream"</param>
+        /// <param name="metaData">Object metadata to be stored. Defaults to null.</param>
+        /// <param name="sse">Server-side encryption option. Defaults to null.</param>
+        /// <param name="cancellationToken">Optional cancellation token to cancel the operation</param>
+        public async Task PutObjectAsync(string bucketName, string objectName, Stream data, string contentType = null, Dictionary<string, string> metaData = null, ServerSideEncryption sse = null, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            utils.ValidateBucketName(bucketName);
+            utils.ValidateObjectName(objectName);
+
+            var sseHeaders = new Dictionary<string, string>();
+            var meta = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (metaData != null) {
+                foreach (KeyValuePair<string, string> p in metaData)
+                {
+                    var key = p.Key;
+                    if (!supportedHeaders.Contains(p.Key, StringComparer.OrdinalIgnoreCase) && !p.Key.StartsWith("x-amz-meta-", StringComparison.OrdinalIgnoreCase))
+                    {
+                        key = "x-amz-meta-" + key.ToLowerInvariant();
+                    }
+                    meta[key] = p.Value;
+
+                }
+            }
+            
+            if (sse != null)
+            {
+                sse.Marshal(sseHeaders);
+            }
+            if (string.IsNullOrWhiteSpace(contentType))
+            {
+                contentType = "application/octet-stream";
+            }
+            if (!meta.ContainsKey("Content-Type"))
+            {
+                meta["Content-Type"] = contentType;
+            }
+            if (data == null)
+            {
+                throw new ArgumentNullException(nameof(data), "Invalid input stream, cannot be null");
+            }
+
+            string uploadId = await this.NewMultipartUploadAsync(bucketName, objectName, meta, sseHeaders, cancellationToken).ConfigureAwait(false);
+
+            // Remove SSE-S3 and KMS headers during PutObjectPart operations.
+            if (sse != null &&
+               (sse.GetType().Equals(EncryptionType.SSE_S3) ||
+                sse.GetType().Equals(EncryptionType.SSE_KMS)))
+            {
+                sseHeaders.Remove(Constants.SSEGenericHeader);
+                sseHeaders.Remove(Constants.SSEKMSContext);
+                sseHeaders.Remove(Constants.SSEKMSKeyId);
+            }
+
+            IList<Part> totalParts = new List<Part>();
+            int partNumber = 1;
+            int numPartsUploaded = 0;
+
+            byte[] dataToCopy = await ReadFullAsync(data, (int) Constants.MinimumPartSize).ConfigureAwait(false);
+            
+            while (dataToCopy != null)
+            { 
+                string etag = await this.PutObjectAsync(bucketName, objectName, uploadId, partNumber, dataToCopy, meta, sseHeaders, cancellationToken).ConfigureAwait(false);
+                
+                totalParts.Add(new Part
+                {
+                    PartNumber = partNumber, ETag = etag, Size = (long)dataToCopy.Length
+                });
+                
+                partNumber++;
+                numPartsUploaded++;
+                
+                dataToCopy = await ReadFullAsync(data, (int) Constants.MinimumPartSize).ConfigureAwait(false);
+            }
+
+            Dictionary<int, string> etags = new Dictionary<int, string>();
+            for (partNumber = 1; partNumber <= numPartsUploaded; partNumber++)
+            {
+                etags[partNumber] = totalParts[partNumber - 1].ETag;
+            }
+            await this.CompleteMultipartUploadAsync(bucketName, objectName, uploadId, etags, cancellationToken).ConfigureAwait(false);
+        }
 
         /// <summary>
         /// Internal method to complete multi part upload of object to server.
